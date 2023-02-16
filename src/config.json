@@ -1,0 +1,18 @@
+{   
+    "base_path": "./",
+    "model_name": "dqn_cartpole",
+    "loss_data_name": "dqn_cartpole",
+
+    "hidden_dim": 256,
+
+    "batch_size": 64,
+    "episodes": 600,
+    "lr": 0.001,
+
+
+    "eps_start": 0.9,
+    "eps_end": 0.05,
+    "eps_decay": 200,
+    "gamma": 0.8,
+    "target_update_duration": 10
+}

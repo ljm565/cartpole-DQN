@@ -1,0 +1,8 @@
+rl/
+.vscode/
+__pycache__/
+model/
+loss/
+.DS_Store
+test.ipynb
+README.md
