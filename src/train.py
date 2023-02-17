@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import OneCycleLR
 
-import cv2
 import gym
 import math
 import pickle
 import random
+import imageio
 from tqdm import tqdm
 from itertools import count
 import matplotlib.pyplot as plt
@@ -209,20 +209,6 @@ class Trainer:
         # make video
         selected_id = durations.index(max(durations))
         all_screens = all_screens[selected_id]
-        # model_name = self.model_path[self.model_path.rfind('/')+1:self.model_path.rfind('.')]
-        # save_p = self.base_path + 'results/' + model_name + '.mp4'
-        # out = cv2.VideoWriter(save_p, cv2.VideoWriter_fourcc('m', 'p', '4', 'v'), 1, all_screens[0].shape[:2])
-        
-        # for s in all_screens:
-        #     out.write(s)
-        # out.release()
-        # cv2.destroyAllWindows()
-
-        for s in all_screens:
-            cv2.imshow('i', s)
-            cv2.waitKey(10)
-        # cv2.imshow('i', all_screens[0])
-        # cv2.waitKey(10)
-        # plt.show()
-
-        
+        model_name = self.model_path[self.model_path.rfind('/')+1:self.model_path.rfind('.')]
+        save_p = self.base_path + 'results/' + model_name + '.gif'
+        imageio.mimsave(save_p, all_screens, fps=50)
