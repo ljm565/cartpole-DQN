@@ -1,0 +1,27 @@
+# base
+seed: 0
+deterministic: True
+
+# environment config
+device: cpu     # examples: [0], [0,1], [1,2,3], cpu, mps... 
+
+# project config
+project: outputs/DQN
+name: cartpole
+
+# model config
+hidden_dim: 256
+
+# train config
+batch_size: 64
+episodes: 600
+lr: 1e-3
+
+# agent action config
+eps_start: 0.9
+eps_end: 0.05
+gamma: 0.8
+target_update_duration: 10
+
+# logging config
+common: ['train_loss', 'train_acc', 'validation_loss', 'validation_acc']

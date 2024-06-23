@@ -59,11 +59,11 @@ Cart Pole DQN에 대한 설명은 [DQN을 이용한 Cart Pole 세우기](https:/
 
 ## 결과
 * ### Cart Pole Duration History
-    <img src="images/duration.png" width="80%"><br><br>
+    <img src="docs/figs/duration.png" width="80%"><br><br>
     gym 라이브러리에 의해 최대 500 duration이 넘어가면 종료됩니다.
 
 * ### Cart Pole 결과
-    <img src="results/dqn_cartpole.gif" width="80%"><br><br>
+    <img src="docs/figs/dqn_cartpole.gif" width="80%"><br><br>
 
 
 <br><br><br>
