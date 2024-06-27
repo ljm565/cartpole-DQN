@@ -59,7 +59,6 @@ if __name__ == '__main__':
     parser.add_argument('-m', '--mode', type=str, required=True, choices=['train', 'resume'])
     parser.add_argument('-r', '--resume_model_dir', type=str, required=False)
     parser.add_argument('-l', '--load_model_type', type=str, default='metric', required=False, choices=['last', 'metric'])
-    parser.add_argument('-p', '--port', type=str, default='10001', required=False)
     args = parser.parse_args()
 
     if args.mode == 'train':
