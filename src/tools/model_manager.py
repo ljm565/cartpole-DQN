@@ -5,15 +5,14 @@ class ModelManager:
     def __init__(self):
         self.is_init = True
         self.lower_candidates_weights = {
-            'validation_loss': 1,
         }
         self.higher_candidates_weights = {
-            'validation_acc': 1,
+            'duration': 1,
         }
 
 
     def save(self, model, model_path, log_data):
-        model_state_dict = model.state_dict()
+        model_state_dict = {k: v.state_dict() for k, v in model.items()}
         checkpoint = {'model': model_state_dict, 'log_data': log_data}
         torch.save(checkpoint, model_path)
 

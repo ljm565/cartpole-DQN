@@ -11,7 +11,7 @@ class DQN(nn.Module):
         self.model = nn.Sequential(
             nn.Linear(4, self.hidden_dim),
             nn.ReLU(),
-            nn.Linear(self.hidden_dim, case_num)
+            nn.Linear(self.hidden_dim, self.case_num)
         )
 
 

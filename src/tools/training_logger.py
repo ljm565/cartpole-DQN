@@ -15,8 +15,7 @@ class TrainingLogger:
         self.log_data.update({k: [] for k in self.log_keys})
         self.train_batch_sizes, self.val_batch_sizes = [], []
         self.st = 0
-        if config.is_rank_zero and self.training:
-            LOGGER.info(f'{colorstr("Logging data")}: {self.log_keys}')
+        LOGGER.info(f'{colorstr("Logging data")}: {self.log_keys}')
         self.model_manager = ModelManager()
     
     

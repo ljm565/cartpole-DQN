@@ -3,7 +3,7 @@ seed: 0
 deterministic: True
 
 # environment config
-device: cpu     # examples: [0], [0,1], [1,2,3], cpu, mps... 
+device: cpu     # examples: [0], cpu, mps... 
 
 # project config
 project: outputs/DQN
@@ -20,8 +20,9 @@ lr: 1e-3
 # agent action config
 eps_start: 0.9
 eps_end: 0.05
+eps_decay: 200
 gamma: 0.8
 target_update_duration: 10
 
 # logging config
-common: ['train_loss', 'train_acc', 'validation_loss', 'validation_acc']
+common: ['loss', 'duration', 'lr']

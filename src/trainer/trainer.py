@@ -1,23 +1,21 @@
 import gc
 import gym
-import sys
-import time
 import math
 import random
 import imageio
+from tqdm import tqdm
 from itertools import count
-import matplotlib.pyplot as plt
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch import distributed as dist
 from torch.optim.lr_scheduler import OneCycleLR
 
 from tools import TrainingLogger
-from trainer.build import get_model, get_data_loader
+from trainer.build import get_model
 from utils import RANK, LOGGER, colorstr, init_seeds
 from utils.filesys_utils import *
+from utils.training_utils import *
 from utils.model_utils import ReplayMemory
 
 
@@ -29,7 +27,6 @@ class Trainer:
             config,
             mode: str,
             device,
-            is_ddp=False,
             resume_path=None,
         ):
         init_seeds(config.seed + 1 + RANK, config.deterministic)
@@ -38,16 +35,12 @@ class Trainer:
         self.mode = mode
         self.is_training_mode = self.mode in ['train', 'resume']
         self.device = torch.device(device)
-        self.is_ddp = is_ddp
-        self.is_rank_zero = True if not self.is_ddp or (self.is_ddp and device == 0) else False
         self.config = config
-        self.world_size = len(self.config.device) if self.is_ddp else 1
         if self.is_training_mode:
-            self.save_dir = make_project_dir(self.config, self.is_rank_zero)
+            self.save_dir = make_project_dir(self.config)
             self.wdir = self.save_dir / 'weights'
 
         # path, data params
-        self.config.is_rank_zero = self.is_rank_zero
         self.resume_path = resume_path
 
         # environment define
@@ -60,7 +53,7 @@ class Trainer:
         self.training_logger = TrainingLogger(self.config, self.is_training_mode)
 
         # save the yaml config
-        if self.is_rank_zero and self.is_training_mode:
+        if self.is_training_mode:
             self.wdir.mkdir(parents=True, exist_ok=True)  # make dir
             self.config.save_dir = str(self.save_dir)
             yaml_save(self.save_dir / 'args.yaml', self.config)  # save run args
@@ -74,28 +67,27 @@ class Trainer:
         self.criterion = nn.SmoothL1Loss()
         if self.is_training_mode:
             self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.config.lr)
-            
+
             # init scheduler
             total_steps = self.episodes
             pct_start = 10 / total_steps
-            final_div_factor = self.lr / 25 / 5e-5
-            self.scheduler = OneCycleLR(self.optimizer, max_lr=self.lr, total_steps=total_steps, pct_start=pct_start, final_div_factor=final_div_factor)
+            final_div_factor = self.config.lr / 25 / 5e-5
+            self.scheduler = OneCycleLR(self.optimizer, max_lr=self.config.lr, total_steps=total_steps, pct_start=pct_start, final_div_factor=final_div_factor)
 
 
     def _init_model(self, config, mode):
-        def _resume_model(resume_path, device, is_rank_zero):
+        def _resume_model(resume_path, device):
             try:
                 checkpoints = torch.load(resume_path, map_location=device)
             except RuntimeError:
                 LOGGER.warning(colorstr('yellow', 'cannot be loaded to MPS, loaded to CPU'))
                 checkpoints = torch.load(resume_path, map_location=torch.device('cpu'))
-            q_net.load_state_dict(checkpoints['q_net'])
-            target.load_state_dict(checkpoints['target'])
+            q_net.load_state_dict(checkpoints['model']['q_net'])
+            target.load_state_dict(checkpoints['model']['target'])
             del checkpoints
             torch.cuda.empty_cache()
             gc.collect()
-            if is_rank_zero:
-                LOGGER.info(f'Resumed model: {colorstr(resume_path)}')
+            LOGGER.info(f'Resumed model: {colorstr(resume_path)}')
             return q_net, target
 
         # init model and tokenizer
@@ -104,244 +96,177 @@ class Trainer:
 
         # resume model or resume model after applying peft
         if do_resume:
-            q_net, target = _resume_model(self.resume_path, self.device, config.is_rank_zero)
+            q_net, target = _resume_model(self.resume_path, self.device)
 
-        # init ddp
-        if self.is_ddp:
-            torch.nn.parallel.DistributedDataParallel(q_net, device_ids=[self.device])
-            torch.nn.parallel.DistributedDataParallel(target, device_ids=[self.device])
-        
         return q_net, target
+    
+
+    def select_action(self, state, phase='train'):
+        if phase == 'test':
+            with torch.no_grad():
+                return torch.argmax(self.q_net(state), dim=1, keepdim=True)
+
+        eps_threshold = self.config.eps_end + (self.config.eps_start - self.config.eps_end) * math.exp(-1. * self.steps_done / self.config.eps_decay)
+        self.steps_done += 1
+
+        # choose bigger action between left and right
+        if random.random() > eps_threshold:
+            with torch.no_grad():
+                return torch.argmax(self.q_net(state), dim=1, keepdim=True)
+        
+        # random action between left and right
+        return torch.tensor([[random.randrange(self.case_num)]], dtype=torch.long).to(self.device)
 
 
     def do_train(self):
+        logging_header = ['Loss', 'duration', 'lr']
+        pbar = init_progress_bar(self.episodes, logging_header)
+        
+        self.steps_done = 0
         self.train_cur_step = -1
-        self.train_time_start = time.time()
-        
-        if self.is_rank_zero:
-            LOGGER.info(f'\nUsing {self.dataloaders["train"].num_workers * (self.world_size or 1)} dataloader workers\n'
-                        f"Logging results to {colorstr('bold', self.save_dir)}\n"
-                        f'Starting training for {self.epochs} epochs...\n')
-        
-        if self.is_ddp:
-            dist.barrier()
+        self.episode_duration = []
+        self.best_duration = 0
+        self.q_net.train()
 
-        for epoch in range(self.epochs):
-            start = time.time()
-            self.epoch = epoch
-
-            if self.is_rank_zero:
-                LOGGER.info('-'*100)
-
-            for phase in self.modes:
-                if self.is_rank_zero:
-                    LOGGER.info('Phase: {}'.format(phase))
-
-                if phase == 'train':
-                    self.epoch_train(phase, epoch)
-                    if self.is_ddp:
-                        dist.barrier()
-                else:
-                    self.epoch_validate(phase, epoch)
-                    if self.is_ddp:
-                        dist.barrier()
+        for episode in pbar:
+            total_loss, total_batch = 0, 0
+            state = self.env.reset()
             
-            # clears GPU vRAM at end of epoch, can help with out of memory errors
-            torch.cuda.empty_cache()
-            gc.collect()
+            for t in count():
+                self.train_cur_step += 1
+                state = torch.FloatTensor([state])
+                action = self.select_action(state)
 
-            # Early Stopping
-            if self.is_ddp:  # if DDP training
-                broadcast_list = [self.stop if self.is_rank_zero else None]
-                dist.broadcast_object_list(broadcast_list, 0)  # broadcast 'stop' to all ranks
-                if not self.is_rank_zero:
-                    self.stop = broadcast_list[0]
+                next_state, reward, done, _ = self.env.step(action.item())
+
+                if done:
+                    reward = -1
+                
+                # push to memory
+                self.memory.push(state, action, reward, next_state)
+
+                # update Q networks
+                loss, batch_size = self.episode_train()
+                total_loss += loss
+                total_batch += batch_size
+
+                # update state
+                state = next_state                
+
+                if done:
+                    self.episode_duration.append(t+1)
+                    break
             
-            if self.stop:
-                break  # must break all DDP ranks
+            self.scheduler.step()
+                
+            if episode % self.config.target_update_duration == 0:
+                self.target.load_state_dict(self.q_net.state_dict())
+                self.target.eval()
 
-            if self.is_rank_zero:
-                LOGGER.info(f"\nepoch {epoch+1} time: {time.time() - start} s\n\n\n")
-
-        if RANK in (-1, 0) and self.is_rank_zero:
-            LOGGER.info(f'\n{epoch + 1} epochs completed in '
-                        f'{(time.time() - self.train_time_start) / 3600:.3f} hours.')
+            # upadate logs and save model
+            self.training_logger.update(
+                    'train', 
+                    episode + 1,
+                    self.train_cur_step,
+                    self.batch_size, 
+                    **{'lr': self.optimizer.param_groups[0]['lr']}
+                )
             
-
-    def epoch_train(
-            self,
-            phase: str,
-            epoch: int
-        ):
-        self.model.train()
-        train_loader = self.dataloaders[phase]
-        nb = len(train_loader)
-
-        if self.is_ddp:
-            train_loader.sampler.set_epoch(epoch)
-
-        # init progress bar
-        if RANK in (-1, 0):
-            logging_header = ['CE Loss', 'Accuracy', 'lr']
-            pbar = init_progress_bar(train_loader, self.is_rank_zero, logging_header, nb)
-
-        for i, (x, label, attn_mask) in pbar:
-            # Warmup
-            self.train_cur_step += 1
-            if self.train_cur_step <= self.warmup_steps_n:
-                self.optimizer.param_groups[0]['lr'] = lr_warmup(self.train_cur_step, self.warmup_steps_n, self.lr0, self.lf)
-            cur_lr = self.optimizer.param_groups[0]['lr']
+            self.training_logger.update(
+                    'validation', 
+                    episode + 1,
+                    self.train_cur_step,
+                    self.batch_size, 
+                    **{'loss': total_loss/total_batch if total_batch != 0 else 0},
+                    **{'duration': self.episode_duration[-1]}
+                )
             
-            batch_size = x.size(0)
-            x, label, attn_mask = x.to(self.device), label.to(self.device), attn_mask.to(self.device)
+            loss_log = [total_loss/total_batch if total_batch != 0 else 0, self.episode_duration[-1], self.optimizer.param_groups[0]['lr']]
+            msg = tuple([f'{episode + 1}/{self.episodes}'] + loss_log)
+            pbar.set_description(('%15s' * 1 + '%15.4g' * len(loss_log)) % msg)
+            
+            self.training_logger.update_phase_end('validation', printing=False)
+            self.training_logger.save_model(self.wdir, {'q_net': self.q_net, 'target': self.target})
+            self.training_logger.save_logs(self.save_dir)
+            
+            # if episode % 10 == 0:
+            #     LOGGER.info('Episode {} duration: {}'.format(episode+1, self.episode_duration[-1]))
 
+            # if self.best_duration <= self.episode_duration[-1]:
+            #     print('Episode {} duration: {}'.format(episode+1, self.episode_duration[-1]))
+            #     self.best_duration = self.episode_duration[-1]
+            #     save_checkpoint(self.model_path, [self.q_net, self.target], self.optimizer)
+
+        LOGGER.info('Training completed')
+        self.env.render()
+        self.env.close()
+
+
+    def episode_train(self):
+        if len(self.memory) >= self.batch_size:
+            batch = self.memory.sample(self.batch_size)
+            states, actions, rewards, next_states = zip(*batch)
+
+            # batch data and current q
+            states = torch.cat(states).to(self.device)
+            actions = torch.cat(actions).to(self.device)
+            rewards = torch.cat(rewards).to(self.device)
+            next_states = torch.cat(next_states).to(self.device)
+
+            # finding current q and max q values
+            curr_q = torch.gather(self.q_net(states), dim=1, index=actions)
+            max_next_q, _ = torch.max(self.target(next_states), dim=1)
+
+            # target q 
+            target_q = rewards + max_next_q * self.config.gamma
+            target_q = target_q.detach()
+            
+            # training
             self.optimizer.zero_grad()
-            output = self.model(x, attn_mask)
-            loss = self.criterion(output, label)
+            loss = self.criterion(curr_q.squeeze(), target_q)
             loss.backward()
             self.optimizer.step()
-            self.scheduler.step()
+            return loss.item(), self.batch_size
+        return 0, 0
 
-            train_acc = torch.sum(torch.argmax(output, dim=-1).detach().cpu() == label.detach().cpu()) / batch_size
 
-            if self.is_rank_zero:
-                self.training_logger.update(
-                    phase, 
-                    epoch + 1,
-                    self.train_cur_step,
-                    batch_size, 
-                    **{'train_loss': loss.item(), 'lr': cur_lr},
-                    **{'train_acc': train_acc.item()}
-                )
-                loss_log = [loss.item(), train_acc.item(), cur_lr]
-                msg = tuple([f'{epoch + 1}/{self.epochs}'] + loss_log)
-                pbar.set_description(('%15s' * 1 + '%15.4g' * len(loss_log)) % msg)
-            
-        # upadate logs
-        if self.is_rank_zero:
-            self.training_logger.update_phase_end(phase, printing=True)
+    def make_gif(self):
+        all_screens, durations = [], []
+        episodes = 10
+        for _ in tqdm(range(episodes)):
+            screens = []
+            state = self.env.reset()
+            for t in count():
+                screen = self.env.render('rgb_array')
+                screens.append(screen)
+
+                state = torch.FloatTensor([state])
+                action = self.select_action(state, 'test')
+
+                next_state, reward, done, _ = self.env.step(action.item())
+
+                if done:
+                    reward = -1
+                
+                # push to memory
+                self.memory.push(state, action, reward, next_state)
+
+                # update state
+                state = next_state                
+
+                if done:
+                    durations.append(t+1)
+                    break
+
+            all_screens.append(screens)
         
+        self.env.close()
+        LOGGER.info(f'{episodes} episode - average duration: {sum(durations)/len(durations)}, max duration: {max(durations)}, min duration: {min(durations)}')
         
-    def epoch_validate(
-            self,
-            phase: str,
-            epoch: int,
-            is_training_now=True
-        ):
-        def _init_log_data_for_vis():
-            data4vis = {'x': [], 'y': [], 'pred': []}
-            return data4vis
-
-        def _append_data_for_vis(**kwargs):
-            for k, v in kwargs.items():
-                self.data4vis[k].append(v)
-
-        with torch.no_grad():
-            if self.is_rank_zero:
-                if not is_training_now:
-                    self.data4vis = _init_log_data_for_vis()
-
-                val_loader = self.dataloaders[phase]
-                nb = len(val_loader)
-                logging_header = ['CE Loss', 'Accuracy']
-                pbar = init_progress_bar(val_loader, self.is_rank_zero, logging_header, nb)
-
-                self.model.eval()
-
-                for i, (x, label, attn_mask) in pbar:
-                    batch_size = x.size(0)
-                    x, label, attn_mask = x.to(self.device), label.to(self.device), attn_mask.to(self.device)
-
-                    output = self.model(x, attn_mask)
-                    loss = self.criterion(output, label)
-
-                    output = torch.argmax(output, dim=-1)
-                    val_acc = torch.sum(output.detach().cpu() == label.detach().cpu()) / batch_size
-
-                    self.training_logger.update(
-                        phase, 
-                        epoch, 
-                        self.train_cur_step if is_training_now else 0, 
-                        batch_size, 
-                        **{'validation_loss': loss.item()},
-                        **{'validation_acc': val_acc.item()}
-                    )
-
-                    loss_log = [loss.item(), val_acc.item()]
-                    msg = tuple([f'{epoch + 1}/{self.epochs}'] + loss_log)
-                    pbar.set_description(('%15s' * 1 + '%15.4g' * len(loss_log)) % msg)
-
-                    if not is_training_now:
-                        _append_data_for_vis(
-                            **{'x': x.detach().cpu(),
-                               'y': label.detach().cpu(),
-                               'pred': output.detach().cpu()}
-                        )
-
-                # upadate logs and save model
-                self.training_logger.update_phase_end(phase, printing=True)
-                if is_training_now:
-                    self.training_logger.save_model(self.wdir, self.model)
-                    self.training_logger.save_logs(self.save_dir)
-
-                    high_fitness = self.training_logger.model_manager.best_higher
-                    low_fitness = self.training_logger.model_manager.best_lower
-                    self.stop = self.stopper(epoch + 1, high=high_fitness, low=low_fitness)
-
-
-    def vis_statistics(self, phase):
-        # validation
-        self.epoch_validate(phase, 0, False)
-        all_x = torch.cat(self.data4vis['x'], dim=0)
-        all_y = torch.cat(self.data4vis['y'], dim=0)
-        all_pred = torch.cat(self.data4vis['pred'], dim=0)
-
-        # cal statistics
-        class_name = ['negative', 'mediocre', 'positive']
-        print(classification_report(all_y, all_pred, target_names=class_name))
-        
-        # visualization the entire statistics
-        vis_save_dir = os.path.join(self.config.save_dir, 'vis_outputs') 
+        # make video
+        LOGGER.info('Video is generated..')
+        selected_id = durations.index(max(durations))
+        all_screens = all_screens[selected_id]
+        vis_save_dir = os.path.join(self.config.save_dir, 'vis_outputs')
         os.makedirs(vis_save_dir, exist_ok=True)
-
-        cm = confusion_matrix(all_y, all_pred)
-        cm = pd.DataFrame(cm, index=class_name, columns=class_name)
-        plt.figure(figsize=(12, 10))
-        plt.imshow(cm, cmap='Blues', interpolation=None)
-        plt.title('Visualized Statistics', fontsize=20)
-        plt.xlabel('Prediction', fontsize=20)
-        plt.ylabel('True', fontsize=20)
-        plt.xticks(range(len(class_name)), class_name, fontsize=17, rotation=30)
-        plt.yticks(range(len(class_name)), class_name, fontsize=17, rotation=30)
-        plt.colorbar()
-        
-        for i in range(cm.shape[1]):
-            for j in range(cm.shape[0]):
-                plt.text(i, j, round(cm.iloc[j, i], 1), ha='center', va='center', fontsize=17)
-        
-        plt.savefig(os.path.join(vis_save_dir, 'statistics.png'))
-
-
-    def print_prediction_results(self, phase, result_num):
-        if result_num > len(self.dataloaders[phase].dataset):
-            LOGGER.info(colorstr('red', 'The number of results that you want to see are larger than total test set'))
-            sys.exit()
-
-        # validation
-        self.epoch_validate(phase, 0, False)
-        all_x = torch.cat(self.data4vis['x'], dim=0)
-        all_y = torch.cat(self.data4vis['y'], dim=0)
-        all_pred = torch.cat(self.data4vis['pred'], dim=0)
-
-        ids = random.sample(range(all_x.size(0)), result_num)
-        all_x = all_x[ids]
-        all_y = all_y[ids]
-        all_pred = all_pred[ids]
-
-        for x, y, p in zip(all_x, all_y, all_pred):
-            gt_label, pred_label = label_mapping(y), label_mapping(p)
-            LOGGER.info(colorstr(self.tokenizer.decode(x.tolist())))
-            LOGGER.info('*'*100)
-            LOGGER.info(f'gt  : {gt_label}')
-            LOGGER.info(f'pred: {pred_label}')
-            LOGGER.info('*'*100 + '\n'*2)
+        imageio.mimsave(os.path.join(vis_save_dir, 'cartpole.gif'), all_screens, fps=50)

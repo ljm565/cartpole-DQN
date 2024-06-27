@@ -5,13 +5,12 @@ from utils import LOGGER, colorstr
 
 
 
-def make_project_dir(config, is_rank_zero=False):
+def make_project_dir(config):
     """
     Make project folder.
 
     Args:
         config: yaml config.
-        is_rank_zero (bool): make folder only at the zero-rank device.
 
     Returns:
         (path): project folder path.
@@ -22,13 +21,11 @@ def make_project_dir(config, is_rank_zero=False):
 
     save_dir = os.path.join(project, name)
     if os.path.exists(save_dir):
-        if is_rank_zero:
-            LOGGER.info(f'{prefix}: Project {save_dir} already exists. New folder will be created.')
+        LOGGER.info(f'{prefix}: Project {save_dir} already exists. New folder will be created.')
         save_dir = os.path.join(project, name + str(len(os.listdir(project))+1))
     
-    if is_rank_zero:
-        os.makedirs(project, exist_ok=True)
-        os.makedirs(save_dir)
+    os.makedirs(project, exist_ok=True)
+    os.makedirs(save_dir)
     
     return Path(save_dir)
 
