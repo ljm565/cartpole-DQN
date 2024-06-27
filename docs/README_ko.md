@@ -1,4 +1,4 @@
-# Cart Pole Training using Deep Q-Learning
+# Cart Pole Training using Deep Q Network
 
 ## Introduction
 본 코드는 [Gymnasimum](https://gymnasium.farama.org/)의 gym 라이브러리를 이용하여 Deep [Q Network (DQN)](https://arxiv.org/pdf/1312.5602.pdf)을 바탕으로 Cart Pole 강화학습을 수행합니다. DQN은 기존 Q-table을 바탕으로 Q learning을 하던 고전적인 방법을 Q-table을 딥러닝 모델로 대체한 딥러닝 기반의 강화학습 알고리즘입니다.
