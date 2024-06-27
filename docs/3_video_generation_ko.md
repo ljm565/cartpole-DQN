@@ -1,4 +1,4 @@
-# Video Geneartion
+# Video Generation
 여기서는 학습된 DQN cart pole 모델의 결과 비디오를 생성하는 가이드를 제공합니다.
 
 ### 1. Video Generation

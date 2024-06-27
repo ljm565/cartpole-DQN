@@ -1,4 +1,4 @@
-# Video Geneartion
+# Video Generation
 Here, we provide a guide for generating video from the trained cart pole model.
 
 ### 1. Video Generation
