@@ -94,7 +94,7 @@ class Trainer:
         do_resume = mode == 'resume' or (mode == 'validation' and self.resume_path)
         q_net, target = get_model(config, self.device)
 
-        # resume model or resume model after applying peft
+        # resume model
         if do_resume:
             q_net, target = _resume_model(self.resume_path, self.device)
 
